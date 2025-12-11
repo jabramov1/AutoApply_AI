@@ -32,7 +32,7 @@ os.environ['OPENAI_API_KEY'] = os.getenv("API_KEY", "")
 os.environ['OPENAI_BASE_URL'] = 'https://api.ai.it.cornell.edu'
 
 llm = ChatOpenAI(
-    model="openai.gpt-5",
+    model="openai.gpt-4o",
     temperature=0.2,
 )
 
@@ -144,6 +144,77 @@ MOCK_JOBS = [
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ATS Checker (Simple Text-Based)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def check_ats_compatibility(raw_text: str, parsed_resume: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Simple ATS compatibility checker - analyzes raw text patterns.
+    No extra API calls needed.
+    """
+    issues = []
+    warnings = []
+    
+    lines = raw_text.split('\n')
+    non_empty_lines = [l for l in lines if l.strip()]
+    
+    # 1. Check for possible multi-column layout (lots of short fragmented lines)
+    if non_empty_lines:
+        short_lines = [l for l in non_empty_lines if 0 < len(l.strip()) < 20]
+        if len(short_lines) > len(non_empty_lines) * 0.5:
+            issues.append("Possible multi-column layout detected - ATS may scramble text order")
+    
+    # 2. Check for standard section headers
+    text_lower = raw_text.lower()
+    if "experience" not in text_lower and "work" not in text_lower:
+        issues.append("Missing 'Experience' or 'Work' section header")
+    if "education" not in text_lower:
+        issues.append("Missing 'Education' section header")
+    if "skill" not in text_lower:
+        warnings.append("Consider adding a 'Skills' section header for better ATS parsing")
+    
+    # 3. Check contact info from parsed data
+    if not parsed_resume.get('email'):
+        issues.append("Missing email address")
+    if not parsed_resume.get('phone'):
+        warnings.append("Missing phone number")
+    
+    # 4. Check for links
+    links = parsed_resume.get('links', [])
+    has_linkedin = any('linkedin' in str(l).lower() for l in links)
+    has_github = any('github' in str(l).lower() for l in links)
+    
+    if not has_linkedin:
+        warnings.append("No LinkedIn URL found - recommended for professional networking")
+    if not has_github and parsed_resume.get('career_level') in ['student', 'entry']:
+        warnings.append("No GitHub URL found - recommended for students/entry-level to showcase code")
+    
+    # 5. Check for skills keywords (important for ATS keyword matching)
+    skills = parsed_resume.get('skills', [])
+    if len(skills) < 5:
+        warnings.append(f"Only {len(skills)} skills listed - consider adding more relevant keywords")
+    
+    # 6. Check for quantified achievements (look for numbers/percentages)
+    import re
+    metrics_pattern = r'\d+%|\d+\+|increased|decreased|improved|reduced|saved|\$\d+'
+    has_metrics = bool(re.search(metrics_pattern, raw_text, re.IGNORECASE))
+    if not has_metrics:
+        warnings.append("No quantified achievements found - add metrics like '40% improvement' or '$50K saved'")
+    
+    # Calculate ATS score
+    ats_score = 100
+    ats_score -= len(issues) * 15  # Major issues
+    ats_score -= len(warnings) * 5  # Minor warnings
+    ats_score = max(0, min(100, ats_score))
+    
+    return {
+        "ats_score": ats_score,
+        "ats_compatible": len(issues) == 0,
+        "issues": issues,
+        "warnings": warnings
+    }
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Agent 1: Resume Parser
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -231,26 +302,47 @@ def parse_resume(resume_text: str) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 CRITIC_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a highly specific, elite tech recruiter. Your job is to maximize the candidate's chances at FAANG/High-Frequency Trading companies.
+    ("system", """You are a senior tech recruiter at a FAANG company reviewing resumes.
 
-    Analyze the structured resume data.
-    
-    CRITICAL RULES FOR FEEDBACK:
-    1. **NO GENERIC FILLER:** Do NOT suggest adding a "Summary", "Objective", or "Soft Skills" section. Top tech companies hate these.
-    2. **RESPECT THE LEVEL:** If the candidate has internships at major tech companies (Google, Amazon, etc.), do NOT suggest "joining clubs" or "doing side projects." Their work experience is already sufficient.
-    3. **ONLY IMPACT MATTERS:** If they have metrics (e.g., "improved by 70%"), do NOT tell them to add metrics. Praise them instead.
-    4. **BE HONEST:** If the resume is excellent, explicitly say "No major changes needed." Do not invent flaws just to fill space.
+TASK: Provide honest, actionable feedback on this resume.
 
-    Return a valid JSON object:
-    {{
-        "status": "Ready|Needs Work",
-        "major_issues": ["Critical flaws only (e.g., missing phone number, 0 projects). If none, leave empty."],
-        "suggestions": ["List specific improvements. If the resume is 90/100+, leave this empty or list 1 advanced tip."],
-        "readiness_score": 0,
-        "summary": "Brief verdict on their standing."
-    }}
-    
-    Return ONLY valid JSON."""),
+STRICT RULES:
+
+1. NO GENERIC FILLER:
+   - Don't suggest "add a summary/objective" (top companies skip these)
+   - Don't suggest "add soft skills" (waste of space)
+   - Don't tell someone with FAANG internships to "do side projects"
+
+2. RESPECT THEIR LEVEL:
+   - Student with TikTok/AWS/Google internships = already strong
+   - If they have metrics ("70% improvement"), praise it - don't ask for more
+
+3. BE HONEST:
+   - Great resume? Say so. Leave suggestions empty.
+   - Don't invent flaws to seem helpful.
+
+4. ONLY FLAG REAL ISSUES:
+   - Missing contact info
+   - Zero relevant experience
+   - Unexplained gaps
+
+OUTPUT (valid JSON only):
+{{
+    "status": "Ready|Needs Work",
+    "readiness_score": 0-100,
+    "strengths": ["2-3 specific strengths"],
+    "major_issues": ["Critical problems only. Empty if none."],
+    "suggestions": ["1-2 tips IF needed. Empty if score 85+."],
+    "summary": "One sentence verdict"
+}}
+
+SCORING:
+- 90-100: FAANG-ready, strong experience, quantified impact
+- 80-89: Solid, minor tweaks possible
+- 70-79: Good foundation, some gaps
+- <70: Needs work
+
+Return ONLY valid JSON."""),
     ("human", "Critique this resume:\n\n{resume_json}")
 ])
 
@@ -442,6 +534,8 @@ if "resume_text" not in st.session_state:
     st.session_state.resume_text = None
 if "parsed_resume" not in st.session_state:
     st.session_state.parsed_resume = None
+if "ats_check" not in st.session_state:
+    st.session_state.ats_check = None
 if "critique" not in st.session_state:
     st.session_state.critique = None
 if "job_matches" not in st.session_state:
@@ -467,6 +561,7 @@ if uploaded_file:
             st.session_state.last_file = uploaded_file.name
             # Reset downstream state when new file uploaded
             st.session_state.parsed_resume = None
+            st.session_state.ats_check = None
             st.session_state.critique = None
             st.session_state.job_matches = None
     
@@ -480,6 +575,11 @@ if uploaded_file:
             with st.spinner("Parsing resume with AI..."):
                 try:
                     st.session_state.parsed_resume = parse_resume(st.session_state.resume_text)
+                    # Run ATS check immediately after parsing
+                    st.session_state.ats_check = check_ats_compatibility(
+                        st.session_state.resume_text, 
+                        st.session_state.parsed_resume
+                    )
                     st.success("✅ Resume parsed successfully!")
                     st.rerun()
                 except Exception as e:
@@ -587,15 +687,23 @@ if st.session_state.parsed_resume:
     # Display critique
     if st.session_state.critique:
         critique = st.session_state.critique
+        ats = st.session_state.ats_check or {}
         
         # Status banner
         status = critique.get('status', 'Unknown')
         score = critique.get('readiness_score', 0)
+        ats_score = ats.get('ats_score', 100)
         
         if status == "Ready":
             st.success(f"🎉 Status: **{status}** | Readiness Score: **{score}/100**")
         else:
             st.warning(f"⚠️ Status: **{status}** | Readiness Score: **{score}/100**")
+        
+        # ATS Status (from our checker, not the LLM)
+        if ats.get('ats_compatible', True):
+            st.success(f"✅ ATS Compatible (Score: {ats_score}/100)")
+        else:
+            st.error(f"❌ ATS Issues Detected (Score: {ats_score}/100)")
         
         # Summary
         st.info(critique.get('summary', 'No summary available'))
@@ -603,6 +711,15 @@ if st.session_state.parsed_resume:
         col1, col2 = st.columns(2)
         
         with col1:
+            # Strengths first
+            st.subheader("💪 Strengths")
+            strengths = critique.get('strengths', [])
+            if strengths:
+                for s in strengths:
+                    st.write(f"• {s}")
+            else:
+                st.write("No specific strengths highlighted")
+            
             st.subheader("🚨 Major Issues")
             issues = critique.get('major_issues', [])
             if issues:
@@ -612,10 +729,24 @@ if st.session_state.parsed_resume:
                 st.write("✅ No major issues found!")
         
         with col2:
+            # ATS issues from our checker
+            ats_issues = ats.get('issues', [])
+            ats_warnings = ats.get('warnings', [])
+            
+            if ats_issues or ats_warnings:
+                st.subheader("🤖 ATS Check")
+                for issue in ats_issues:
+                    st.write(f"❌ {issue}")
+                for warning in ats_warnings:
+                    st.write(f"⚠️ {warning}")
+            
             st.subheader("💡 Suggestions")
             suggestions = critique.get('suggestions', [])
-            for suggestion in suggestions:
-                st.write(f"• {suggestion}")
+            if suggestions:
+                for suggestion in suggestions:
+                    st.write(f"• {suggestion}")
+            else:
+                st.write("✅ No suggestions - resume looks solid!")
 
 # ─────────────────────────────────────────────────────────────────────────
 # Step 4: Job Matching
@@ -715,4 +846,4 @@ if st.session_state.parsed_resume:
 # ─────────────────────────────────────────────────────────────────────────
 
 st.divider()
-st.caption("AutoApply AI - Built with LangChain, GPT-5, and Streamlit for Cornell CS")
+st.caption("AutoApply AI - Built with LangChain, GPT-4o, and Streamlit for Cornell CS")
