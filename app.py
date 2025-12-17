@@ -40,7 +40,7 @@ llm = ChatOpenAI(
 )
 
 # NEW: Tool for Live Search
-search_tool = DuckDuckGoSearchResults(backend="news")
+search_tool = DuckDuckGoSearchResults()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Mock Job Data (8-10 sample jobs) - KEPT EXACTLY AS ORIGINAL
@@ -483,8 +483,17 @@ def search_live_jobs(resume_data: Dict[str, Any], role: str, location: str):
     raw_results = ""
     for q in strategy['queries']:
         try:
-            raw_results += search_tool.run(q) + "\n"
-        except: pass
+            # Add a small delay if needed to avoid rate limits
+            results = search_tool.run(q)
+            raw_results += results + "\n"
+        except Exception as e:
+            # Print error to UI so you don't get "empty space" without knowing why
+            st.error(f"Search failed for query '{q}': {e}")
+            pass
+            
+    if not raw_results.strip():
+        st.error("No search results found. DuckDuckGo might be rate-limiting requests.")
+        return []
         
     # 3. Matcher
     match_chain = WEB_MATCHER_PROMPT | llm | JsonOutputParser()
