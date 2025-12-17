@@ -1,10 +1,10 @@
 """
-AutoApply AI - Resume to Jobs Pipeline (Full Suite)
+AutoApply AI - Resume to Jobs Pipeline (Cornell CS Final Build)
 
 A multi-agent LangChain application that:
 1. Parses resumes into structured JSON (Agent 1)
 2. Critiques resumes with generous feedback (Agent 2)
-3. Matches resumes to jobs using EITHER Mock Data OR Live Web Search (Agent 3 + Scout)
+3. Matches resumes to jobs using EITHER Mock Data OR Live DuckDuckGo Search (Agent 3)
 4. Generates personalized cover letters (Agent 4)
 5. Generates Interview Prep Guides (Agent 5)
 
@@ -15,22 +15,25 @@ import streamlit as st
 import json
 import tempfile
 import os
+import time
+import random
 from typing import Dict, List, Any
 
+# LangChain Imports
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
-# NEW IMPORT:
 from langchain_community.tools import DuckDuckGoSearchResults
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Environment & LLM Setup (Cornell API)
+# 0. Environment & LLM Setup
 # ──────────────────────────────────────────────────────────────────────────────
 
 load_dotenv()  # Load .env file
 
+# Cornell API Setup
 os.environ['OPENAI_API_KEY'] = os.getenv("API_KEY", "")
 os.environ['OPENAI_BASE_URL'] = 'https://api.ai.it.cornell.edu'
 
@@ -39,11 +42,8 @@ llm = ChatOpenAI(
     temperature=0.2,
 )
 
-# NEW: Tool for Live Search
-search_tool = DuckDuckGoSearchResults()
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Mock Job Data (8-10 sample jobs) - KEPT EXACTLY AS ORIGINAL
+# 1. Mock Job Data (10 sample jobs for Demo Mode)
 # ──────────────────────────────────────────────────────────────────────────────
 
 MOCK_JOBS = [
@@ -150,7 +150,7 @@ MOCK_JOBS = [
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ATS Checker (Simple Text-Based) - KEPT EXACTLY AS ORIGINAL
+# 2. ATS Checker (Regex & Rule Based)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def check_ats_compatibility(raw_text: str, parsed_resume: Dict[str, Any]) -> Dict[str, Any]:
@@ -221,7 +221,36 @@ def check_ats_compatibility(raw_text: str, parsed_resume: Dict[str, Any]) -> Dic
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Agent 1: Resume Parser - KEPT EXACTLY AS ORIGINAL
+# 3. Utility: File Loading
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_resume_file(uploaded_file) -> str:
+    """Load and extract text from uploaded resume file."""
+    file_name = uploaded_file.name
+    file_extension = file_name.split('.')[-1].lower() if '.' in file_name else 'txt'
+    
+    # Save to temp file
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}")
+    temp_file.write(uploaded_file.getvalue())
+    temp_file.close()
+    tmp_file_path = temp_file.name
+    
+    try:
+        # Choose loader based on file type
+        if file_extension == "pdf":
+            loader = PyPDFLoader(tmp_file_path)
+        else:
+            loader = TextLoader(tmp_file_path)
+        
+        documents = loader.load()
+        text = "\n".join([doc.page_content for doc in documents])
+        return text
+    finally:
+        # Clean up temp file
+        os.remove(tmp_file_path)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AGENT 1: Resume Parser
 # ──────────────────────────────────────────────────────────────────────────────
 
 PARSER_PROMPT = ChatPromptTemplate.from_messages([
@@ -304,7 +333,7 @@ def parse_resume(resume_text: str) -> Dict[str, Any]:
     return json.loads(result.strip())
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Agent 2: Resume Critic - KEPT EXACTLY AS ORIGINAL
+# AGENT 2: Resume Critic
 # ──────────────────────────────────────────────────────────────────────────────
 
 CRITIC_PROMPT = ChatPromptTemplate.from_messages([
@@ -369,7 +398,7 @@ def critique_resume(resume_data: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(result.strip())
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Agent 3A: Mock Job Matcher - KEPT EXACTLY AS ORIGINAL
+# AGENT 3A: Mock Job Matcher (Demo Mode)
 # ──────────────────────────────────────────────────────────────────────────────
 
 MATCHER_PROMPT = ChatPromptTemplate.from_messages([
@@ -413,7 +442,7 @@ JOBS:
 ])
 
 def match_jobs(resume_data: Dict[str, Any], jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Agent 3: Score and rank jobs against the resume."""
+    """Agent 3A: Score and rank jobs against the resume."""
     chain = MATCHER_PROMPT | llm | StrOutputParser()
     result = chain.invoke({
         "resume_json": json.dumps(resume_data, indent=2),
@@ -434,77 +463,217 @@ def match_jobs(resume_data: Dict[str, Any], jobs: List[Dict[str, Any]]) -> List[
     return sorted(matches, key=lambda x: x.get("match_score", 0), reverse=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Agent 3B: Live Web Search Matcher (NEW AGENT ADDED)
+# AGENT 3B: Live Web Search Matcher (DuckDuckGo - No blocking!)
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Initialize search tool with MORE results per query
+search_tool = DuckDuckGoSearchResults(num_results=20)
+
 STRATEGIST_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a Search Strategist. Generate 3 Boolean search queries to find ATS job links (Greenhouse, Lever, etc).
-    Return JSON: {{ "queries": ["query1", "query2", "query3"] }}"""),
-    ("human", "Role: {role}, Location: {location}, Skills: {skills}")
+    ("system", """You are a Master Job Search Strategist. Generate **8 diverse search queries** to find CURRENT, OPEN job listings.
+
+CRITICAL REQUIREMENTS:
+1. We want FULL-TIME JOBS, NOT internships (unless user specifically wants internships)
+2. Jobs must be CURRENTLY HIRING (add "2024" or "2025" or "hiring now" or "apply now")
+3. Each query should target DIFFERENT job boards or approaches
+4. Include the job title, location, and key skills
+
+TARGET SITES (vary across queries):
+- Direct ATS: greenhouse.io, lever.co, ashbyhq.com, workable.com, jobs.lever.co
+- Startup/Tech: wellfound.com, builtin.com, weworkremotely.com, ycombinator.com/jobs
+- Big Boards: linkedin.com/jobs, indeed.com, glassdoor.com, ziprecruiter.com
+
+QUERY PATTERNS TO USE (mix these):
+- "{role} {location} hiring 2025"
+- "{role} jobs {skill} apply now"
+- "careers {role} {location} open positions"
+- "{company_type} {role} remote jobs 2025"
+- "join our team {role} {location}"
+
+User wants: {job_type} positions (NOT internships unless specified)
+Role: {role}
+Location: {location}
+Key Skills: {skills}
+
+Return JSON with exactly 8 queries:
+{{ "queries": ["query1", "query2", "query3", "query4", "query5", "query6", "query7", "query8"] }}
+"""),
+    ("human", "Generate 8 diverse search queries for current job openings.")
 ])
 
 WEB_MATCHER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a Career Analyst. Analyze search snippets from the web.
-    1. Extract valid job listings.
-    2. Score them (0-100) based on resume.
-    
-    Return JSON List:
-    [
-        {{
-            "job_id": "random_id",
-            "title": "extracted title",
-            "company": "extracted company",
-            "link": "extracted url",
-            "location": "location",
-            "match_score": int,
-            "reasoning": "str",
-            "skill_matches": ["str"],
-            "skill_gaps": ["str"],
-            "requirements": ["inferred from snippet"],
-            "description": "short summary",
-            "recommendation": "highly_recommended|good_fit|possible|poor_fit"
-        }}
-    ]"""),
-    ("human", "Resume: {resume_summary}\n\nSearch Results: {search_results}")
+    ("system", """You are a Job Listing Extractor. Extract ALL valid job postings from these search results.
+
+CRITICAL RULES:
+1. Extract EVERY job posting you can find - we want QUANTITY
+2. Only include {job_type} positions (EXCLUDE internships unless user wants them)
+3. Jobs should appear to be CURRENT (2024-2025) and OPEN
+4. If a listing looks like a real job posting, INCLUDE IT
+5. Extract the actual apply link if visible in the snippet
+
+For each job found, create an entry. Extract as many as possible (aim for 15-30+ jobs).
+
+Return a JSON array:
+[
+    {{
+        "job_id": "unique_id_1",
+        "title": "Exact Job Title from listing",
+        "company": "Company Name",
+        "link": "URL to apply (use the link from snippet)",
+        "location": "Location or Remote",
+        "match_score": 75,
+        "reasoning": "Brief match analysis",
+        "skill_matches": ["matching skills from resume"],
+        "skill_gaps": ["skills job wants that candidate lacks"],
+        "requirements": ["key requirements mentioned"],
+        "description": "Job description summary",
+        "recommendation": "highly_recommended|good_fit|possible|poor_fit"
+    }}
+]
+
+Scoring Guide:
+- 85-100: Excellent skill match + right level (highly_recommended)
+- 70-84: Good match with minor gaps (good_fit)
+- 50-69: Partial match (possible)
+- Below 50: Poor fit (poor_fit)
+
+IMPORTANT: Return as many jobs as you can extract. More is better!"""),
+    ("human", """Candidate Profile: 
+- Career Level: {career_level}
+- Years Experience: {years_exp}
+- Skills: {skills}
+- Looking for: {job_type} positions
+
+Search Results to analyze:
+{search_results}""")
 ])
 
-def search_live_jobs(resume_data: Dict[str, Any], role: str, location: str):
-    """Agent 3B: Search Live Jobs on DuckDuckGo and Rank them."""
+def search_live_jobs(resume_data: Dict[str, Any], role: str, location: str, job_type: str = "full-time"):
+    """Agent 3B: Search Live Jobs using DuckDuckGo and rank them."""
     
-    # 1. Strategist
+    career_level = resume_data.get('career_level', 'entry').lower()
+    skills_list = resume_data.get('skills', [])[:8]
+    
+    # 2. Run Strategist to generate search queries
     strat_chain = STRATEGIST_PROMPT | llm | JsonOutputParser()
-    strategy = strat_chain.invoke({
-        "role": role,
-        "location": location,
-        "skills": ", ".join(resume_data.get('skills', [])[:5])
-    })
     
-    # 2. Scout (Tool)
+    try:
+        strategy = strat_chain.invoke({
+            "role": role,
+            "location": location,
+            "skills": ", ".join(skills_list),
+            "job_type": job_type,
+        })
+        queries = strategy.get('queries', [])
+    except Exception as e:
+        st.error(f"Error generating search queries: {e}")
+        # Fallback to manual queries that work well
+        queries = [
+            f"{role} {location} jobs hiring 2025",
+            f"{role} {location} careers apply now",
+            f"{role} remote jobs 2025 hiring",
+            f"greenhouse.io {role} {location}",
+            f"lever.co {role} jobs open",
+            f"wellfound {role} startup jobs",
+            f"linkedin jobs {role} {location} 2025",
+            f"indeed {role} {location} full time",
+        ]
+    
+    st.write(f"🧠 **Strategist Plan:** Generated {len(queries)} search queries")
+    
+    # Show queries in debug
+    with st.expander("🔍 Search Queries", expanded=False):
+        for i, q in enumerate(queries, 1):
+            st.write(f"{i}. {q}")
+    
+    # 3. Scout - Search DuckDuckGo with ALL queries
     raw_results = ""
-    for q in strategy['queries']:
-        try:
-            # Add a small delay if needed to avoid rate limits
-            results = search_tool.run(q)
-            raw_results += results + "\n"
-        except Exception as e:
-            # Print error to UI so you don't get "empty space" without knowing why
-            st.error(f"Search failed for query '{q}': {e}")
-            pass
-            
-    if not raw_results.strip():
-        st.error("No search results found. DuckDuckGo might be rate-limiting requests.")
-        return []
+    total_snippets = 0
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, query in enumerate(queries):
+        progress_bar.progress((i + 1) / len(queries))
+        status_text.text(f"🔍 Searching ({i+1}/{len(queries)}): {query[:40]}...")
         
-    # 3. Matcher
+        try:
+            # Small delay to avoid rate limiting
+            if i > 0:
+                time.sleep(random.uniform(0.3, 0.8))
+            
+            results = search_tool.run(query)
+            if results and len(results) > 50:  # Got meaningful results
+                raw_results += f"\n\n=== QUERY {i+1}: {query} ===\n{results}\n"
+                # Count approximate snippets
+                snippet_count = results.count("snippet:")
+                total_snippets += max(snippet_count, 1)
+                st.success(f"✅ Query {i+1}: Found ~{max(snippet_count, 1)} results")
+            else:
+                st.warning(f"⚠️ Query {i+1}: Few/no results")
+            
+        except Exception as e:
+            st.warning(f"⚠️ Query {i+1} failed: {str(e)[:50]}")
+            continue
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    st.info(f"📊 Total: ~{total_snippets} search snippets collected from {len(queries)} queries")
+    
+    if not raw_results.strip():
+        st.error("No search results found. Try different search terms or try again.")
+        return []
+    
+    # Show raw results in debug expander
+    with st.expander("🔧 Debug: Raw Search Results", expanded=False):
+        st.text(raw_results[:8000] + ("..." if len(raw_results) > 8000 else ""))
+    
+    # 4. Matcher - Analyze and extract ALL jobs
+    st.info("🤖 AI is extracting and ranking job listings...")
     match_chain = WEB_MATCHER_PROMPT | llm | JsonOutputParser()
-    matches = match_chain.invoke({
-        "resume_summary": f"{resume_data.get('years_of_experience')} years exp. Skills: {resume_data.get('skills')}",
-        "search_results": raw_results
-    })
-    return sorted(matches, key=lambda x: x.get("match_score", 0), reverse=True)
+    
+    try:
+        matches = match_chain.invoke({
+            "career_level": career_level,
+            "years_exp": resume_data.get('years_of_experience', 0),
+            "skills": ", ".join(skills_list),
+            "job_type": job_type,
+            "search_results": raw_results[:25000]  # Send more context
+        })
+        
+        if not matches:
+            st.warning("No valid job postings extracted. The search results may not have contained job listings. Try different keywords.")
+            return []
+        
+        st.success(f"✅ Extracted {len(matches)} job listings!")
+        return sorted(matches, key=lambda x: x.get("match_score", 0), reverse=True)
+        
+    except Exception as e:
+        st.error(f"Error analyzing results: {e}")
+        return []
+    
+    # 4. Matcher - Analyze and rank results
+    st.text("🤖 Analyzing results...")
+    match_chain = WEB_MATCHER_PROMPT | llm | JsonOutputParser()
+    
+    try:
+        matches = match_chain.invoke({
+            "resume_summary": f"Career Level: {career_level}, Years Experience: {resume_data.get('years_of_experience', 0)}, Skills: {', '.join(resume_data.get('skills', [])[:10])}",
+            "search_results": raw_results[:15000]  # Limit to avoid token issues
+        })
+        
+        if not matches:
+            st.warning("No valid job postings were extracted from the search results. Try different search terms.")
+            return []
+            
+        return sorted(matches, key=lambda x: x.get("match_score", 0), reverse=True)
+        
+    except Exception as e:
+        st.error(f"Error analyzing results: {e}")
+        return []
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Agent 4: Cover Letter Generator - KEPT EXACTLY AS ORIGINAL
+# AGENT 4: Cover Letter Generator
 # ──────────────────────────────────────────────────────────────────────────────
 
 COVER_LETTER_PROMPT = ChatPromptTemplate.from_messages([
@@ -556,7 +725,7 @@ def generate_cover_letter(resume_data: Dict[str, Any], job: Dict[str, Any]) -> s
     return result.strip()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Agent 5: Interview Coach (NEW AGENT ADDED)
+# AGENT 5: Interview Coach
 # ──────────────────────────────────────────────────────────────────────────────
 
 COACH_PROMPT = ChatPromptTemplate.from_messages([
@@ -591,35 +760,6 @@ def generate_interview_prep(resume_data, job_list):
         "resume_json": json.dumps(resume_data),
         "job_list": job_summary
     })
-
-# ──────────────────────────────────────────────────────────────────────────────
-# File Processing (from RAG example) - KEPT EXACTLY AS ORIGINAL
-# ──────────────────────────────────────────────────────────────────────────────
-
-def load_resume_file(uploaded_file) -> str:
-    """Load and extract text from uploaded resume file."""
-    file_name = uploaded_file.name
-    file_extension = file_name.split('.')[-1].lower() if '.' in file_name else 'txt'
-    
-    # Save to temp file
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}")
-    temp_file.write(uploaded_file.getvalue())
-    temp_file.close()
-    tmp_file_path = temp_file.name
-    
-    try:
-        # Choose loader based on file type
-        if file_extension == "pdf":
-            loader = PyPDFLoader(tmp_file_path)
-        else:
-            loader = TextLoader(tmp_file_path)
-        
-        documents = loader.load()
-        text = "\n".join([doc.page_content for doc in documents])
-        return text
-    finally:
-        # Clean up temp file
-        os.remove(tmp_file_path)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Streamlit UI
@@ -670,7 +810,7 @@ if "interview_prep" not in st.session_state:
     st.session_state.interview_prep = None
 
 # ─────────────────────────────────────────────────────────────────────────
-# Step 1: File Upload - KEPT EXACTLY AS ORIGINAL
+# Step 1: File Upload
 # ─────────────────────────────────────────────────────────────────────────
 
 st.header("Step 1: Upload Your Resume")
@@ -715,7 +855,7 @@ if uploaded_file:
                     st.error(f"Error parsing resume: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────
-# Step 2: Show Parsed Resume + Critique - KEPT EXACTLY AS ORIGINAL
+# Step 2: Show Parsed Resume + Critique
 # ─────────────────────────────────────────────────────────────────────────
 
 if st.session_state.parsed_resume:
@@ -902,18 +1042,23 @@ if st.session_state.parsed_resume:
 
     # TAB 2: NEW LIVE SEARCH LOGIC
     with tab2:
-        st.caption("Uses AI Agents to search the real web (DuckDuckGo) for live job listings.")
-        col_search_1, col_search_2 = st.columns(2)
+        st.caption("Uses AI Agents to search the real web (DuckDuckGo) for CURRENT job openings.")
+        
+        col_search_1, col_search_2, col_search_3 = st.columns(3)
         target_role = col_search_1.text_input("Target Role", "Software Engineer")
         target_loc = col_search_2.text_input("Location", "Remote")
+        job_type = col_search_3.selectbox("Job Type", ["full-time", "internship", "contract", "part-time"], index=0)
+        
+        st.info("💡 Tip: Be specific with role (e.g., 'Backend Engineer Python' instead of just 'Engineer')")
         
         if st.button("🚀 Search Live Jobs", type="primary"):
-            with st.spinner("Agents are searching the web and ranking results..."):
+            with st.spinner("🔍 Searching across multiple job boards..."):
                 try:
                     st.session_state.job_matches = search_live_jobs(
                         st.session_state.parsed_resume, 
                         target_role, 
-                        target_loc
+                        target_loc,
+                        job_type
                     )
                     # Reset prep if jobs change
                     st.session_state.interview_prep = None
@@ -1031,4 +1176,4 @@ if st.session_state.parsed_resume:
 # ─────────────────────────────────────────────────────────────────────────
 
 st.divider()
-st.caption("AutoApply AI - Built with LangChain, GPT-4o, and Streamlit for Cornell CS")
+st.caption("AutoApply AI - Built with LangChain, GPT-4o, Selenium, and Streamlit")

@@ -5,4 +5,5 @@ langchain-community>=0.0.10
 langchain-core>=0.1.0
 pypdf>=3.17.0
 python-dotenv>=1.0.0
+duckduckgo-search>=4.0.0
 
