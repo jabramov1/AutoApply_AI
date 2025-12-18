@@ -17,6 +17,7 @@ import tempfile
 import os
 import time
 import random
+from datetime import datetime, timedelta
 from typing import Dict, List, Any
 
 # LangChain Imports
@@ -466,8 +467,106 @@ def match_jobs(resume_data: Dict[str, Any], jobs: List[Dict[str, Any]]) -> List[
 # AGENT 3B: Live Web Search Matcher (DuckDuckGo - No blocking!)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Initialize search tool with MORE results per query
-search_tool = DuckDuckGoSearchResults(num_results=20)
+# DuckDuckGo tool returns structured results (list[dict]) instead of a concatenated string.
+# Each item is shaped like: {"title": str, "link": str, "snippet": str}
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def ddg_search(query: str, num_results: int = 20) -> List[Dict[str, str]]:
+    """Cached DuckDuckGo query returning structured results."""
+    tool = DuckDuckGoSearchResults(num_results=num_results, output_format="list")
+    results = tool.run(query)
+    return results if isinstance(results, list) else []
+
+def _limit_json_array_payload(items: List[Dict[str, Any]], max_chars: int) -> str:
+    """Return a valid JSON array string truncated by item count (never mid-JSON)."""
+    selected: List[Dict[str, Any]] = []
+    for item in items:
+        candidate = selected + [item]
+        candidate_json = json.dumps(candidate, ensure_ascii=False)
+        if len(candidate_json) > max_chars and selected:
+            break
+        selected = candidate
+    return json.dumps(selected, ensure_ascii=False)
+
+def _extract_posted_datetime_from_snippet(snippet: str, now: datetime) -> datetime | None:
+    """Best-effort extract of a posting date from a search snippet."""
+    import re
+
+    s = (snippet or "").strip()
+    if not s:
+        return None
+
+    # Relative dates like "1 day ago", "3 weeks ago"
+    rel_match = re.search(r"\b(\d+)\s+(day|days|week|weeks|month|months|year|years)\s+ago\b", s, re.IGNORECASE)
+    if rel_match:
+        amount = int(rel_match.group(1))
+        unit = rel_match.group(2).lower()
+        if unit.startswith("day"):
+            return now - timedelta(days=amount)
+        if unit.startswith("week"):
+            return now - timedelta(weeks=amount)
+        if unit.startswith("month"):
+            return now - timedelta(days=30 * amount)
+        if unit.startswith("year"):
+            return now - timedelta(days=365 * amount)
+
+    if re.search(r"\btoday\b", s, re.IGNORECASE):
+        return now
+    if re.search(r"\byesterday\b", s, re.IGNORECASE):
+        return now - timedelta(days=1)
+
+    # Absolute dates like "Oct 16, 2025"
+    abs_match = re.search(
+        r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\s+(\d{1,2}),\s*(\d{4})\b",
+        s,
+        re.IGNORECASE,
+    )
+    if abs_match:
+        month = abs_match.group(1).title()
+        if month == "Sept":
+            month = "Sep"
+        day = int(abs_match.group(2))
+        year = int(abs_match.group(3))
+        try:
+            return datetime.strptime(f"{month} {day} {year}", "%b %d %Y")
+        except ValueError:
+            return None
+
+    return None
+
+def _filter_results_by_recency(
+    results: List[Dict[str, str]],
+    recency_days: int | None,
+    include_undated: bool,
+    now: datetime,
+) -> tuple[List[Dict[str, str]], Dict[str, int]]:
+    """Filter search results by snippet-recency when possible."""
+    kept: List[Dict[str, str]] = []
+    stats = {"total": len(results), "kept": 0, "dropped_old": 0, "dropped_future": 0, "undated_kept": 0, "undated_dropped": 0}
+
+    for r in results:
+        posted_at = _extract_posted_datetime_from_snippet(r.get("snippet", ""), now=now)
+        if posted_at is None:
+            if include_undated:
+                kept.append(r)
+                stats["undated_kept"] += 1
+            else:
+                stats["undated_dropped"] += 1
+            continue
+
+        # Some snippets contain "future" dates (or bad parses); drop if far in the future.
+        if posted_at > now + timedelta(days=7):
+            stats["dropped_future"] += 1
+            continue
+
+        if recency_days is not None and (now - posted_at).days > recency_days:
+            stats["dropped_old"] += 1
+            continue
+
+        kept.append(r)
+
+    stats["kept"] = len(kept)
+    return kept, stats
 
 STRATEGIST_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """You are a Master Job Search Strategist. Generate **8 diverse search queries** to find CURRENT, OPEN job listings.
@@ -485,15 +584,17 @@ TARGET SITES (vary across queries):
 
 QUERY PATTERNS TO USE (mix these):
 - "{role} {location} hiring 2025"
-- "{role} jobs {skill} apply now"
+- "{role} jobs (one key skill) apply now"
 - "careers {role} {location} open positions"
-- "{company_type} {role} remote jobs 2025"
+- "(startup|fintech|enterprise) {role} remote jobs 2025"
 - "join our team {role} {location}"
 
 User wants: {job_type} positions (NOT internships unless specified)
 Role: {role}
+Related role titles to consider: {role_variants}
 Location: {location}
 Key Skills: {skills}
+Recency preference: {recency_hint}
 
 Return JSON with exactly 8 queries:
 {{ "queries": ["query1", "query2", "query3", "query4", "query5", "query6", "query7", "query8"] }}
@@ -501,15 +602,66 @@ Return JSON with exactly 8 queries:
     ("human", "Generate 8 diverse search queries for current job openings.")
 ])
 
+ROLE_EXPANDER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You help expand a job search beyond a single title.
+
+Given a primary role and a candidate skill profile, propose closely related role titles that a recruiter would consider equivalent or adjacent.
+
+Rules:
+- Return 6-8 role titles
+- Keep them realistic and commonly used in postings
+- Match the user's job_type intent (e.g., don't suggest internships if job_type is full-time)
+- Favor titles aligned to the skills/domains provided
+
+Return JSON:
+{{"roles": ["role1", "role2", "role3", "role4", "role5", "role6"]}}
+"""),
+    ("human", """Primary role: {role}
+Job type: {job_type}
+Candidate domains: {domains}
+Top skills: {skills}""")
+])
+
+def generate_related_roles(resume_data: Dict[str, Any], role: str, job_type: str) -> List[str]:
+    chain = ROLE_EXPANDER_PROMPT | llm | JsonOutputParser()
+    domains = ", ".join(resume_data.get("domains", [])[:6])
+    skills = ", ".join(resume_data.get("skills", [])[:10])
+    try:
+        out = chain.invoke({"role": role, "job_type": job_type, "domains": domains, "skills": skills})
+        roles = out.get("roles", []) if isinstance(out, dict) else []
+        cleaned = []
+        for r in roles:
+            rs = str(r).strip()
+            if rs and rs.lower() != role.lower():
+                cleaned.append(rs)
+        # De-dupe while preserving order
+        deduped = list(dict.fromkeys([role] + cleaned))
+        return deduped[:8]
+    except Exception:
+        return [role]
+
 WEB_MATCHER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a Job Listing Extractor. Extract ALL valid job postings from these search results.
+    ("system", """You are a Job Listing Extractor. Extract ALL valid job postings from these DuckDuckGo search results.
 
 CRITICAL RULES:
 1. Extract EVERY job posting you can find - we want QUANTITY
 2. Only include {job_type} positions (EXCLUDE internships unless user wants them)
 3. Jobs should appear to be CURRENT (2024-2025) and OPEN
 4. If a listing looks like a real job posting, INCLUDE IT
-5. Extract the actual apply link if visible in the snippet
+5. Use the "link" field as the best available apply link
+
+INPUT FORMAT:
+You are given a JSON array of search results, each shaped like:
+{{
+  "query": "the query that produced this result",
+  "title": "result title",
+  "link": "URL",
+  "snippet": "snippet text"
+}}
+
+IMPORTANT:
+- Not every search result is a job posting. Only include entries that look like real job listings.
+- De-duplicate: if multiple results point to the same job URL, include it once.
 
 For each job found, create an entry. Extract as many as possible (aim for 15-30+ jobs).
 
@@ -548,12 +700,32 @@ Search Results to analyze:
 {search_results}""")
 ])
 
-def search_live_jobs(resume_data: Dict[str, Any], role: str, location: str, job_type: str = "full-time"):
+def search_live_jobs(
+    resume_data: Dict[str, Any],
+    role: str,
+    location: str,
+    job_type: str = "full-time",
+    *,
+    expand_related_roles: bool = True,
+    recency_days: int | None = 30,
+    include_undated: bool = True,
+):
     """Agent 3B: Search Live Jobs using DuckDuckGo and rank them."""
     
     career_level = resume_data.get('career_level', 'entry').lower()
     skills_list = resume_data.get('skills', [])[:8]
+
+    try:
+        import ddgs  # noqa: F401
+    except ImportError:
+        st.error("Live search requires the `ddgs` package. Install it with `pip install -U ddgs` and restart the app.")
+        return []
     
+    # 1. Optionally expand to related role titles
+    roles_to_search = generate_related_roles(resume_data, role=role, job_type=job_type) if expand_related_roles else [role]
+    role_variants = ", ".join(roles_to_search[:6])
+    recency_hint = "any" if recency_days is None else f"last {recency_days} days"
+
     # 2. Run Strategist to generate search queries
     strat_chain = STRATEGIST_PROMPT | llm | JsonOutputParser()
     
@@ -563,32 +735,39 @@ def search_live_jobs(resume_data: Dict[str, Any], role: str, location: str, job_
             "location": location,
             "skills": ", ".join(skills_list),
             "job_type": job_type,
+            "role_variants": role_variants,
+            "recency_hint": recency_hint,
         })
         queries = strategy.get('queries', [])
     except Exception as e:
         st.error(f"Error generating search queries: {e}")
         # Fallback to manual queries that work well
+        primary_role = roles_to_search[0] if roles_to_search else role
         queries = [
-            f"{role} {location} jobs hiring 2025",
-            f"{role} {location} careers apply now",
-            f"{role} remote jobs 2025 hiring",
-            f"greenhouse.io {role} {location}",
-            f"lever.co {role} jobs open",
-            f"wellfound {role} startup jobs",
-            f"linkedin jobs {role} {location} 2025",
-            f"indeed {role} {location} full time",
+            f"{primary_role} {location} jobs hiring 2025",
+            f"{primary_role} {location} careers apply now",
+            f"{primary_role} remote jobs 2025 hiring",
+            f"greenhouse.io {primary_role} {location}",
+            f"lever.co {primary_role} jobs open",
+            f"wellfound {primary_role} startup jobs",
+            f"linkedin jobs {primary_role} {location} 2025",
+            f"indeed {primary_role} {location} full time",
         ]
     
-    st.write(f"🧠 **Strategist Plan:** Generated {len(queries)} search queries")
+    st.write(
+        f"🧠 **Strategist Plan:** Generated {len(queries)} search queries"
+        + (f" across {min(len(roles_to_search), 6)} role variants" if expand_related_roles else "")
+    )
     
     # Show queries in debug
     with st.expander("🔍 Search Queries", expanded=False):
         for i, q in enumerate(queries, 1):
             st.write(f"{i}. {q}")
     
-    # 3. Scout - Search DuckDuckGo with ALL queries
-    raw_results = ""
-    total_snippets = 0
+    # 3. Scout - Search DuckDuckGo with ALL queries (structured results)
+    all_results: List[Dict[str, str]] = []
+    seen_links = set()
+    total_results = 0
     progress_bar = st.progress(0)
     status_text = st.empty()
     
@@ -601,44 +780,73 @@ def search_live_jobs(resume_data: Dict[str, Any], role: str, location: str, job_
             if i > 0:
                 time.sleep(random.uniform(0.3, 0.8))
             
-            results = search_tool.run(query)
-            if results and len(results) > 50:  # Got meaningful results
-                raw_results += f"\n\n=== QUERY {i+1}: {query} ===\n{results}\n"
-                # Count approximate snippets
-                snippet_count = results.count("snippet:")
-                total_snippets += max(snippet_count, 1)
-                st.success(f"✅ Query {i+1}: Found ~{max(snippet_count, 1)} results")
-            else:
+            results = ddg_search(query, num_results=20)
+            if not results:
                 st.warning(f"⚠️ Query {i+1}: Few/no results")
+                continue
+
+            new_count = 0
+            for r in results:
+                link = str(r.get("link", "")).strip()
+                if not link or link in seen_links:
+                    continue
+                seen_links.add(link)
+                all_results.append(
+                    {
+                        "query": query,
+                        "title": str(r.get("title", "")),
+                        "link": link,
+                        "snippet": str(r.get("snippet", "")),
+                    }
+                )
+                new_count += 1
+
+            total_results += len(results)
+            st.success(f"✅ Query {i+1}: {new_count} new (of {len(results)})")
             
         except Exception as e:
-            st.warning(f"⚠️ Query {i+1} failed: {str(e)[:50]}")
+            st.warning(f"⚠️ Query {i+1} failed: {str(e)[:80]}")
             continue
     
     progress_bar.empty()
     status_text.empty()
+
+    # Optional recency filter (best-effort, based on snippet text)
+    now = datetime.now()
+    all_results, filter_stats = _filter_results_by_recency(
+        all_results, recency_days=recency_days, include_undated=include_undated, now=now
+    )
+    if recency_days is not None:
+        st.info(
+            f"🗓️ Recency filter ({recency_days}d): kept {filter_stats['kept']}/{filter_stats['total']} "
+            f"(dropped old={filter_stats['dropped_old']}, future={filter_stats['dropped_future']}, "
+            f"undated kept={filter_stats['undated_kept']}, undated dropped={filter_stats['undated_dropped']})"
+        )
+
+    st.info(
+        f"📊 Total: {len(all_results)} unique results (from ~{total_results} total) across {len(queries)} queries"
+    )
     
-    st.info(f"📊 Total: ~{total_snippets} search snippets collected from {len(queries)} queries")
-    
-    if not raw_results.strip():
+    if not all_results:
         st.error("No search results found. Try different search terms or try again.")
         return []
     
     # Show raw results in debug expander
     with st.expander("🔧 Debug: Raw Search Results", expanded=False):
-        st.text(raw_results[:8000] + ("..." if len(raw_results) > 8000 else ""))
+        st.json(all_results[:50])
     
     # 4. Matcher - Analyze and extract ALL jobs
     st.info("🤖 AI is extracting and ranking job listings...")
     match_chain = WEB_MATCHER_PROMPT | llm | JsonOutputParser()
     
     try:
+        search_results_json = _limit_json_array_payload(all_results, max_chars=25_000)
         matches = match_chain.invoke({
             "career_level": career_level,
             "years_exp": resume_data.get('years_of_experience', 0),
             "skills": ", ".join(skills_list),
             "job_type": job_type,
-            "search_results": raw_results[:25000]  # Send more context
+            "search_results": search_results_json
         })
         
         if not matches:
@@ -646,26 +854,6 @@ def search_live_jobs(resume_data: Dict[str, Any], role: str, location: str, job_
             return []
         
         st.success(f"✅ Extracted {len(matches)} job listings!")
-        return sorted(matches, key=lambda x: x.get("match_score", 0), reverse=True)
-        
-    except Exception as e:
-        st.error(f"Error analyzing results: {e}")
-        return []
-    
-    # 4. Matcher - Analyze and rank results
-    st.text("🤖 Analyzing results...")
-    match_chain = WEB_MATCHER_PROMPT | llm | JsonOutputParser()
-    
-    try:
-        matches = match_chain.invoke({
-            "resume_summary": f"Career Level: {career_level}, Years Experience: {resume_data.get('years_of_experience', 0)}, Skills: {', '.join(resume_data.get('skills', [])[:10])}",
-            "search_results": raw_results[:15000]  # Limit to avoid token issues
-        })
-        
-        if not matches:
-            st.warning("No valid job postings were extracted from the search results. Try different search terms.")
-            return []
-            
         return sorted(matches, key=lambda x: x.get("match_score", 0), reverse=True)
         
     except Exception as e:
@@ -1048,17 +1236,32 @@ if st.session_state.parsed_resume:
         target_role = col_search_1.text_input("Target Role", "Software Engineer")
         target_loc = col_search_2.text_input("Location", "Remote")
         job_type = col_search_3.selectbox("Job Type", ["full-time", "internship", "contract", "part-time"], index=0)
+
+        col_opt_1, col_opt_2, col_opt_3 = st.columns(3)
+        expand_related_roles = col_opt_1.toggle("Expand to related roles", value=True)
+        recency_choice = col_opt_2.selectbox("Recency Filter", ["Any", "Last 7 days", "Last 30 days", "Last 90 days", "Last 365 days"], index=2)
+        include_undated = col_opt_3.toggle("Keep results without dates", value=True)
         
         st.info("💡 Tip: Be specific with role (e.g., 'Backend Engineer Python' instead of just 'Engineer')")
         
         if st.button("🚀 Search Live Jobs", type="primary"):
             with st.spinner("🔍 Searching across multiple job boards..."):
                 try:
+                    recency_days = {
+                        "Any": None,
+                        "Last 7 days": 7,
+                        "Last 30 days": 30,
+                        "Last 90 days": 90,
+                        "Last 365 days": 365,
+                    }[recency_choice]
                     st.session_state.job_matches = search_live_jobs(
                         st.session_state.parsed_resume, 
                         target_role, 
                         target_loc,
-                        job_type
+                        job_type,
+                        expand_related_roles=expand_related_roles,
+                        recency_days=recency_days,
+                        include_undated=include_undated,
                     )
                     # Reset prep if jobs change
                     st.session_state.interview_prep = None

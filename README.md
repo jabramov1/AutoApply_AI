@@ -16,6 +16,7 @@ AutoApply AI is a multi-agent LangChain + Streamlit app that turns a resume into
 - Streamlit UI
 - LangChain + OpenAI-compatible chat model (`langchain-openai`)
 - PDF text extraction via `pypdf` (through `PyPDFLoader`)
+- Optional: Live job search via DuckDuckGo (`ddgs`)
 
 ## Setup
 
@@ -63,6 +64,7 @@ Then open the local URL Streamlit prints (usually `http://localhost:8501`).
 ## Project Notes / Limitations
 
 - Job postings are mock data defined in `app.py` (`MOCK_JOBS`).
+- Live job search requires the `ddgs` package (included in `requirements.txt`).
 - The resume parser/critic/matcher/cover-letter steps rely on LLM outputs and may be imperfect; always review results.
 - Avoid uploading sensitive information unless you understand and accept where the API is hosted and how data is handled.
 
